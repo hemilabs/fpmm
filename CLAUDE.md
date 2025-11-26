@@ -81,8 +81,9 @@ The system consists of 6 Solidity contracts with clear separation of concerns:
 - Hemi-specific convenience functions
 
 **SimpleRouter.sol** - User-friendly wrapper
-- Named functions (buyYes, buyNo, etc.) for binary outcomes
+- Generic multi-outcome functions: `buyOutcome(marketId, outcomeIndex, ...)`, `sellOutcome(...)`
 - Auto-detect winning outcome for redemption
+- View functions for prices, balances, and estimates across all outcomes
 
 ## Key Design Patterns
 
@@ -112,11 +113,22 @@ Markets support config flags (bitfield):
 
 ## Oracle Interface
 
-New oracles must implement `IOutcomeOracle`:
+New oracles must implement `IOutcomeOracle`. The interface uses a multi-outcome pattern that supports both binary (Yes/No) markets and markets with more than 2 outcomes (up to 8):
+
 ```solidity
 interface IOutcomeOracle {
-    enum Outcome { Undefined, Yes, No, Invalid }
     function requestResolution(bytes32 questionId) external;
-    function getOutcome(bytes32 questionId) external view returns (Outcome, bool resolved, uint64 resolutionTime);
+    function getOutcome(bytes32 questionId) external view returns (
+        uint8 winningOutcomeIndex,  // 0 to (numOutcomes-1)
+        bool isInvalid,             // true if question cannot be resolved
+        bool resolved,              // true once resolution is complete
+        uint64 resolutionTime       // timestamp of resolution
+    );
 }
 ```
+
+**Multi-Outcome Design:**
+- `winningOutcomeIndex`: For binary markets, 0 = No, 1 = Yes (standard boolean convention)
+- For multi-outcome markets: indices 0, 1, 2, ... N-1 correspond to each possible outcome
+- `isInvalid`: Set to true when the question cannot be resolved (ambiguous, cancelled, etc.)
+- When `isInvalid` is true, `winningOutcomeIndex` should be ignored

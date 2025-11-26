@@ -92,23 +92,24 @@ contract UniV3EthUsdTwapOracleAdapter is IOutcomeOracle {
     /**
      * @notice Configuration and state for a threshold question
      * @dev Packed for storage efficiency across 4 storage slots
-     * 
+     *      This is a binary oracle: outcome index 0 = No, index 1 = Yes
+     *
      * Slot 1 (32 bytes):
      * - pool: 20 bytes
      * - twapWindow: 4 bytes
      * - evalTime: 8 bytes
-     * 
+     *
      * Slot 2 (24 bytes used):
      * - baseToken: 20 bytes
      * - greaterThan: 1 byte
      * - exists: 1 byte
      * - resolved: 1 byte
-     * - outcome: 1 byte
-     * 
+     * - winningOutcomeIndex: 1 byte (0 = No, 1 = Yes)
+     *
      * Slot 3 (28 bytes used):
      * - quoteToken: 20 bytes
      * - resolutionTime: 8 bytes
-     * 
+     *
      * Slot 4 (32 bytes):
      * - threshold: 32 bytes
      */
@@ -120,7 +121,7 @@ contract UniV3EthUsdTwapOracleAdapter is IOutcomeOracle {
         bool greaterThan;       // true: YES if price >= threshold
         bool exists;            // Question has been registered
         bool resolved;          // Question has been resolved
-        Outcome outcome;        // Final outcome (Yes/No/Invalid/Undefined)
+        uint8 winningOutcomeIndex; // 0 = Yes, 1 = No (binary market convention)
         address quoteToken;     // Quote token (USDC) - the denomination
         uint64 resolutionTime;  // Unix timestamp when resolved
         uint256 threshold;      // Price threshold in quote token decimals
@@ -158,13 +159,13 @@ contract UniV3EthUsdTwapOracleAdapter is IOutcomeOracle {
     /**
      * @notice Emitted when a question is resolved
      * @param questionId The resolved question
-     * @param outcome Final outcome (Yes or No)
+     * @param winningOutcomeIndex Index of winning outcome (0=No, 1=Yes for binary)
      * @param price Actual TWAP price at resolution
      * @param resolutionTime Unix timestamp of resolution
      */
     event ThresholdQuestionResolved(
         bytes32 indexed questionId,
-        Outcome outcome,
+        uint8 winningOutcomeIndex,
         uint256 price,
         uint64 resolutionTime
     );
@@ -228,7 +229,7 @@ contract UniV3EthUsdTwapOracleAdapter is IOutcomeOracle {
             greaterThan: greaterThan,
             exists: true,
             resolved: false,
-            outcome: Outcome.Undefined,
+            winningOutcomeIndex: 0,
             resolutionTime: 0
         });
         
@@ -272,7 +273,7 @@ contract UniV3EthUsdTwapOracleAdapter is IOutcomeOracle {
         ));
         
         if (questions[questionId].exists) revert QuestionAlreadyExists();
-        
+
         questions[questionId] = ThresholdQuestion({
             pool: HEMI_ETH_USDC_POOL,
             baseToken: HEMI_WETH,
@@ -283,7 +284,7 @@ contract UniV3EthUsdTwapOracleAdapter is IOutcomeOracle {
             greaterThan: greaterThan,
             exists: true,
             resolved: false,
-            outcome: Outcome.Undefined,
+            winningOutcomeIndex: 0,
             resolutionTime: 0
         });
         
@@ -327,25 +328,26 @@ contract UniV3EthUsdTwapOracleAdapter is IOutcomeOracle {
             q.quoteToken,
             q.twapWindow
         );
-        
-        // Determine outcome based on threshold comparison
-        Outcome outcome;
+
+        // Determine winning outcome based on threshold comparison
+        // Binary market convention: 0 = No, 1 = Yes (standard boolean)
+        uint8 winningIndex;
         if (q.greaterThan) {
             // Question: "Will ETH be >= threshold?"
-            outcome = twapPrice >= q.threshold ? Outcome.Yes : Outcome.No;
+            winningIndex = twapPrice >= q.threshold ? 1 : 0; // 1=Yes, 0=No
         } else {
             // Question: "Will ETH be <= threshold?"
-            outcome = twapPrice <= q.threshold ? Outcome.Yes : Outcome.No;
+            winningIndex = twapPrice <= q.threshold ? 1 : 0; // 1=Yes, 0=No
         }
-        
+
         // Store resolution (permanent)
         q.resolved = true;
-        q.outcome = outcome;
+        q.winningOutcomeIndex = winningIndex;
         q.resolutionTime = uint64(block.timestamp);
-        
+
         emit ThresholdQuestionResolved(
             questionId,
-            outcome,
+            winningIndex,
             twapPrice,
             q.resolutionTime
         );
@@ -354,20 +356,24 @@ contract UniV3EthUsdTwapOracleAdapter is IOutcomeOracle {
     /**
      * @notice Get the outcome for a question
      * @param questionId The question to query
-     * @return outcome The resolved outcome (Undefined if not yet resolved)
+     * @return winningOutcomeIndex Index of winning outcome (0=No, 1=Yes for binary)
+     * @return isInvalid True if resolved as invalid (always false for this oracle)
      * @return resolved Whether the question has been resolved
      * @return resolutionTime Unix timestamp when resolution occurred (0 if not resolved)
      */
     function getOutcome(bytes32 questionId) external view override returns (
-        Outcome outcome,
+        uint8 winningOutcomeIndex,
+        bool isInvalid,
         bool resolved,
         uint64 resolutionTime
     ) {
         ThresholdQuestion storage q = questions[questionId];
-        
+
         if (!q.exists) revert QuestionNotFound();
-        
-        return (q.outcome, q.resolved, q.resolutionTime);
+
+        // This oracle never returns invalid - it always resolves to Yes or No
+        // based on the TWAP price comparison
+        return (q.winningOutcomeIndex, false, q.resolved, q.resolutionTime);
     }
 
     // ============ View Functions ============

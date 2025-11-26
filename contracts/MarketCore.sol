@@ -350,39 +350,28 @@ contract MarketCore is ReentrancyGuard {
      */
     function finalizeMarket(bytes32 marketId) external {
         if (!marketExists[marketId]) revert MarketNotFound();
-        
+
         MarketData storage market = _markets[marketId];
-        
+
         if (market.status == MarketStatus.Resolved) revert MarketAlreadyResolved();
-        
+
         MarketParams storage params = market.params;
-        
-        // Fetch outcome from oracle
+
+        // Fetch outcome from oracle (multi-outcome interface)
         (
-            IOutcomeOracle.Outcome outcome,
+            uint8 winningOutcomeIndex,
+            bool isInvalid,
             bool resolved,
             /* resolutionTime */
         ) = IOutcomeOracle(params.oracle).getOutcome(params.questionId);
-        
+
         if (!resolved) revert OracleNotResolved();
-        
-        // Map oracle outcome to market state
-        if (outcome == IOutcomeOracle.Outcome.Invalid) {
-            market.isInvalid = true;
-            market.winningOutcomeIndex = 0;
-        } else if (outcome == IOutcomeOracle.Outcome.Yes) {
-            // YES = outcome index 0
-            market.winningOutcomeIndex = 0;
-        } else if (outcome == IOutcomeOracle.Outcome.No) {
-            // NO = outcome index 1
-            market.winningOutcomeIndex = 1;
-        } else {
-            // Undefined - should not happen after resolution
-            revert OracleNotResolved();
-        }
-        
+
+        // Store oracle result directly (supports 2-8 outcomes)
+        market.isInvalid = isInvalid;
+        market.winningOutcomeIndex = winningOutcomeIndex;
         market.status = MarketStatus.Resolved;
-        
+
         emit MarketFinalized(marketId, market.winningOutcomeIndex, market.isInvalid);
     }
 

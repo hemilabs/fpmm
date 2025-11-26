@@ -10,32 +10,32 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
  * @author Hemi Prediction Markets
  * @notice High-level UX wrapper for prediction market interactions
  * @dev Provides simplified, user-friendly interface for common prediction market operations
- * 
+ *
  * This router simplifies user interactions by:
  * - Handling token approvals transparently (users only approve router once)
- * - Providing named functions for binary outcomes (buyYes, buyNo, sellYes, sellNo)
+ * - Providing generic functions for any number of outcomes (2-8)
  * - Auto-detecting winning outcome for redemptions
  * - Batching multi-step operations into single transactions
- * 
+ *
  * Supported Operations:
- * - Buy YES/NO tokens with collateral
- * - Sell YES/NO tokens for collateral
+ * - Buy outcome tokens with collateral (any outcome index)
+ * - Sell outcome tokens for collateral (any outcome index)
  * - Redeem winning tokens after market resolution
  * - Add/remove liquidity to/from markets
  * - Query prices, balances, and estimates
- * 
+ *
  * Architecture:
  * - Thin wrapper around FpmmAMM and MarketCore
  * - Stateless except for immutable contract references
  * - No admin, owner, or governance functions
  * - All user funds flow through immediately - never held
- * 
+ *
  * Security Model:
  * - ReentrancyGuard on all entry points
  * - Non-custodial - router never holds user funds
  * - Permissionless and ungoverned
  * - Implements ERC-1155 receiver for token handling
- * 
+ *
  * Gas Optimizations:
  * - Lazy approval pattern (approve once, use forever)
  * - Minimal intermediate storage
@@ -45,113 +45,80 @@ contract SimpleRouter is ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     // ============ Errors ============
-    
+
     /// @notice Address cannot be zero
     error ZeroAddress();
-    
+
     /// @notice Amount cannot be zero
     error ZeroAmount();
-    
-    /// @notice Market must have exactly 2 outcomes for binary functions
-    error MarketNotBinary();
-    
-    /// @notice Token approval failed
-    error ApprovalFailed();
-    
+
+    /// @notice Outcome index is out of valid range for this market
+    error InvalidOutcomeIndex();
+
     /// @notice Market is not resolved yet
     error MarketNotResolved();
 
-    // ============ Constants ============
-    
-    /// @notice Outcome index for YES (always 0 in binary markets)
-    uint8 public constant YES = 0;
-    
-    /// @notice Outcome index for NO (always 1 in binary markets)
-    uint8 public constant NO = 1;
-
     // ============ Immutable References ============
-    
+
     /// @notice MarketCore contract for market state and redemptions
     address public immutable marketCore;
-    
+
     /// @notice FpmmAMM contract for trading and liquidity
     address public immutable fpmmAMM;
-    
+
     /// @notice OutcomeToken1155 contract for outcome token transfers
     address public immutable outcomeToken1155;
 
     // ============ Events ============
-    
+
     /**
-     * @notice Emitted when user buys YES tokens
+     * @notice Emitted when user buys outcome tokens
      * @param marketId The market traded in
      * @param buyer Address of buyer
+     * @param outcomeIndex Index of outcome purchased
      * @param collateralIn Collateral spent
-     * @param yesTokensOut YES tokens received
+     * @param tokensOut Outcome tokens received
      */
-    event YesBought(
+    event OutcomeBought(
         bytes32 indexed marketId,
         address indexed buyer,
+        uint8 outcomeIndex,
         uint256 collateralIn,
-        uint256 yesTokensOut
+        uint256 tokensOut
     );
-    
+
     /**
-     * @notice Emitted when user buys NO tokens
-     * @param marketId The market traded in
-     * @param buyer Address of buyer
-     * @param collateralIn Collateral spent
-     * @param noTokensOut NO tokens received
-     */
-    event NoBought(
-        bytes32 indexed marketId,
-        address indexed buyer,
-        uint256 collateralIn,
-        uint256 noTokensOut
-    );
-    
-    /**
-     * @notice Emitted when user sells YES tokens
+     * @notice Emitted when user sells outcome tokens
      * @param marketId The market traded in
      * @param seller Address of seller
-     * @param yesTokensIn YES tokens sold
+     * @param outcomeIndex Index of outcome sold
+     * @param tokensIn Outcome tokens sold
      * @param collateralOut Collateral received
      */
-    event YesSold(
+    event OutcomeSold(
         bytes32 indexed marketId,
         address indexed seller,
-        uint256 yesTokensIn,
+        uint8 outcomeIndex,
+        uint256 tokensIn,
         uint256 collateralOut
     );
-    
-    /**
-     * @notice Emitted when user sells NO tokens
-     * @param marketId The market traded in
-     * @param seller Address of seller
-     * @param noTokensIn NO tokens sold
-     * @param collateralOut Collateral received
-     */
-    event NoSold(
-        bytes32 indexed marketId,
-        address indexed seller,
-        uint256 noTokensIn,
-        uint256 collateralOut
-    );
-    
+
     /**
      * @notice Emitted when user redeems winning tokens
      * @param marketId The resolved market
      * @param user Address of redeemer
+     * @param outcomeIndex Index of outcome redeemed
      * @param amount Tokens redeemed
      * @param collateralReceived Collateral received
      */
     event WinningsRedeemed(
         bytes32 indexed marketId,
         address indexed user,
+        uint8 outcomeIndex,
         uint256 amount,
         uint256 collateralReceived
     );
-    
+
     /**
      * @notice Emitted when user adds liquidity
      * @param marketId The market
@@ -165,7 +132,7 @@ contract SimpleRouter is ReentrancyGuard {
         uint256 collateralAmount,
         uint256 lpShares
     );
-    
+
     /**
      * @notice Emitted when user removes liquidity
      * @param marketId The market
@@ -181,7 +148,7 @@ contract SimpleRouter is ReentrancyGuard {
     );
 
     // ============ Constructor ============
-    
+
     /**
      * @notice Deploy the router with references to core contracts
      * @param _marketCore Address of MarketCore contract
@@ -196,172 +163,112 @@ contract SimpleRouter is ReentrancyGuard {
         if (_marketCore == address(0)) revert ZeroAddress();
         if (_fpmmAMM == address(0)) revert ZeroAddress();
         if (_outcomeToken1155 == address(0)) revert ZeroAddress();
-        
+
         marketCore = _marketCore;
         fpmmAMM = _fpmmAMM;
         outcomeToken1155 = _outcomeToken1155;
     }
 
     // ============ Trading Functions ============
-    
+
     /**
-     * @notice Buy YES outcome tokens
+     * @notice Buy outcome tokens for a specific outcome
      * @param marketId The market to trade in
+     * @param outcomeIndex Index of the outcome to buy (0 to numOutcomes-1)
      * @param collateralIn Amount of collateral to spend
-     * @param minYesOut Minimum YES tokens to receive (slippage protection)
-     * @return yesOut Actual YES tokens received
+     * @param minTokensOut Minimum outcome tokens to receive (slippage protection)
+     * @return tokensOut Actual outcome tokens received
      * @dev User must have approved this router to spend their collateral
      */
-    function buyYes(
+    function buyOutcome(
         bytes32 marketId,
+        uint8 outcomeIndex,
         uint256 collateralIn,
-        uint256 minYesOut
-    ) external nonReentrant returns (uint256 yesOut) {
+        uint256 minTokensOut
+    ) external nonReentrant returns (uint256 tokensOut) {
         if (collateralIn == 0) revert ZeroAmount();
-        
-        // Get collateral token from market config
-        address collateralToken = _getCollateralToken(marketId);
-        
+
+        // Get market config to validate outcome index
+        (
+            address collateralToken,
+            uint8 numOutcomes,
+            ,
+        ) = IFpmmAMM(fpmmAMM).getFpmmMarketConfig(marketId);
+
+        if (outcomeIndex >= numOutcomes) revert InvalidOutcomeIndex();
+
         // Transfer collateral from user to router
         IERC20(collateralToken).safeTransferFrom(msg.sender, address(this), collateralIn);
-        
+
         // Ensure FpmmAMM has approval to spend router's collateral
         _ensureApproval(collateralToken, fpmmAMM, collateralIn);
-        
+
         // Execute buy through FpmmAMM
-        yesOut = IFpmmAMM(fpmmAMM).buyOutcome(marketId, YES, collateralIn, minYesOut);
-        
-        // Transfer YES tokens from router to user
-        uint256 yesTokenId = _computeOutcomeTokenId(marketId, YES);
+        tokensOut = IFpmmAMM(fpmmAMM).buyOutcome(marketId, outcomeIndex, collateralIn, minTokensOut);
+
+        // Transfer outcome tokens from router to user
+        uint256 tokenId = _computeOutcomeTokenId(marketId, outcomeIndex);
         IOutcomeToken1155(outcomeToken1155).safeTransferFrom(
             address(this),
             msg.sender,
-            yesTokenId,
-            yesOut,
+            tokenId,
+            tokensOut,
             ""
         );
-        
-        emit YesBought(marketId, msg.sender, collateralIn, yesOut);
+
+        emit OutcomeBought(marketId, msg.sender, outcomeIndex, collateralIn, tokensOut);
     }
-    
+
     /**
-     * @notice Buy NO outcome tokens
+     * @notice Sell outcome tokens for collateral
      * @param marketId The market to trade in
-     * @param collateralIn Amount of collateral to spend
-     * @param minNoOut Minimum NO tokens to receive (slippage protection)
-     * @return noOut Actual NO tokens received
-     * @dev User must have approved this router to spend their collateral
-     */
-    function buyNo(
-        bytes32 marketId,
-        uint256 collateralIn,
-        uint256 minNoOut
-    ) external nonReentrant returns (uint256 noOut) {
-        if (collateralIn == 0) revert ZeroAmount();
-        
-        // Get collateral token from market config
-        address collateralToken = _getCollateralToken(marketId);
-        
-        // Transfer collateral from user to router
-        IERC20(collateralToken).safeTransferFrom(msg.sender, address(this), collateralIn);
-        
-        // Ensure FpmmAMM has approval to spend router's collateral
-        _ensureApproval(collateralToken, fpmmAMM, collateralIn);
-        
-        // Execute buy through FpmmAMM
-        noOut = IFpmmAMM(fpmmAMM).buyOutcome(marketId, NO, collateralIn, minNoOut);
-        
-        // Transfer NO tokens from router to user
-        uint256 noTokenId = _computeOutcomeTokenId(marketId, NO);
-        IOutcomeToken1155(outcomeToken1155).safeTransferFrom(
-            address(this),
-            msg.sender,
-            noTokenId,
-            noOut,
-            ""
-        );
-        
-        emit NoBought(marketId, msg.sender, collateralIn, noOut);
-    }
-    
-    /**
-     * @notice Sell YES outcome tokens for collateral
-     * @param marketId The market to trade in
-     * @param yesIn Amount of YES tokens to sell
+     * @param outcomeIndex Index of the outcome to sell (0 to numOutcomes-1)
+     * @param tokensIn Amount of outcome tokens to sell
      * @param minCollateralOut Minimum collateral to receive (slippage protection)
      * @return collateralOut Actual collateral received
      * @dev User must have approved this router for their outcome tokens
      */
-    function sellYes(
+    function sellOutcome(
         bytes32 marketId,
-        uint256 yesIn,
+        uint8 outcomeIndex,
+        uint256 tokensIn,
         uint256 minCollateralOut
     ) external nonReentrant returns (uint256 collateralOut) {
-        if (yesIn == 0) revert ZeroAmount();
-        
-        // Transfer YES tokens from user to router
-        uint256 yesTokenId = _computeOutcomeTokenId(marketId, YES);
+        if (tokensIn == 0) revert ZeroAmount();
+
+        // Get market config to validate outcome index
+        (
+            address collateralToken,
+            uint8 numOutcomes,
+            ,
+        ) = IFpmmAMM(fpmmAMM).getFpmmMarketConfig(marketId);
+
+        if (outcomeIndex >= numOutcomes) revert InvalidOutcomeIndex();
+
+        // Transfer outcome tokens from user to router
+        uint256 tokenId = _computeOutcomeTokenId(marketId, outcomeIndex);
         IOutcomeToken1155(outcomeToken1155).safeTransferFrom(
             msg.sender,
             address(this),
-            yesTokenId,
-            yesIn,
+            tokenId,
+            tokensIn,
             ""
         );
-        
+
         // Ensure FpmmAMM has approval to handle router's outcome tokens
         _ensureOutcomeApproval();
-        
+
         // Execute sell through FpmmAMM
-        collateralOut = IFpmmAMM(fpmmAMM).sellOutcome(marketId, YES, yesIn, minCollateralOut);
-        
+        collateralOut = IFpmmAMM(fpmmAMM).sellOutcome(marketId, outcomeIndex, tokensIn, minCollateralOut);
+
         // Transfer collateral to user
-        address collateralToken = _getCollateralToken(marketId);
         IERC20(collateralToken).safeTransfer(msg.sender, collateralOut);
-        
-        emit YesSold(marketId, msg.sender, yesIn, collateralOut);
-    }
-    
-    /**
-     * @notice Sell NO outcome tokens for collateral
-     * @param marketId The market to trade in
-     * @param noIn Amount of NO tokens to sell
-     * @param minCollateralOut Minimum collateral to receive (slippage protection)
-     * @return collateralOut Actual collateral received
-     * @dev User must have approved this router for their outcome tokens
-     */
-    function sellNo(
-        bytes32 marketId,
-        uint256 noIn,
-        uint256 minCollateralOut
-    ) external nonReentrant returns (uint256 collateralOut) {
-        if (noIn == 0) revert ZeroAmount();
-        
-        // Transfer NO tokens from user to router
-        uint256 noTokenId = _computeOutcomeTokenId(marketId, NO);
-        IOutcomeToken1155(outcomeToken1155).safeTransferFrom(
-            msg.sender,
-            address(this),
-            noTokenId,
-            noIn,
-            ""
-        );
-        
-        // Ensure FpmmAMM has approval to handle router's outcome tokens
-        _ensureOutcomeApproval();
-        
-        // Execute sell through FpmmAMM
-        collateralOut = IFpmmAMM(fpmmAMM).sellOutcome(marketId, NO, noIn, minCollateralOut);
-        
-        // Transfer collateral to user
-        address collateralToken = _getCollateralToken(marketId);
-        IERC20(collateralToken).safeTransfer(msg.sender, collateralOut);
-        
-        emit NoSold(marketId, msg.sender, noIn, collateralOut);
+
+        emit OutcomeSold(marketId, msg.sender, outcomeIndex, tokensIn, collateralOut);
     }
 
     // ============ Redemption Functions ============
-    
+
     /**
      * @notice Redeem winning outcome tokens for collateral (auto-detects winner)
      * @param marketId The resolved market
@@ -375,16 +282,16 @@ contract SimpleRouter is ReentrancyGuard {
         uint256 amount
     ) external nonReentrant returns (uint256 collateralOut) {
         if (amount == 0) revert ZeroAmount();
-        
+
         // Get market state to find winning outcome
         (
             IMarketCore.MarketStatus status,
             uint8 winningIndex,
             /* isInvalid */
         ) = IMarketCore(marketCore).getMarketState(marketId);
-        
+
         if (status != IMarketCore.MarketStatus.Resolved) revert MarketNotResolved();
-        
+
         // Transfer winning tokens from user to router
         uint256 tokenId = _computeOutcomeTokenId(marketId, winningIndex);
         IOutcomeToken1155(outcomeToken1155).safeTransferFrom(
@@ -394,28 +301,28 @@ contract SimpleRouter is ReentrancyGuard {
             amount,
             ""
         );
-        
+
         // Ensure MarketCore has approval to burn router's outcome tokens
         _ensureOutcomeApproval();
-        
+
         // Execute redemption through MarketCore
         IMarketCore(marketCore).redeemWinnings(marketId, winningIndex, amount);
-        
+
         // Transfer collateral to user (1:1 redemption)
         address collateralToken = _getCollateralToken(marketId);
         collateralOut = amount;
         IERC20(collateralToken).safeTransfer(msg.sender, collateralOut);
-        
-        emit WinningsRedeemed(marketId, msg.sender, amount, collateralOut);
+
+        emit WinningsRedeemed(marketId, msg.sender, winningIndex, amount, collateralOut);
     }
-    
+
     /**
-     * @notice Redeem specific outcome tokens (for multi-outcome or invalid markets)
+     * @notice Redeem specific outcome tokens (for invalid markets with refund enabled)
      * @param marketId The resolved market
-     * @param outcomeIndex Which outcome to redeem (use for invalid markets with refund)
+     * @param outcomeIndex Which outcome to redeem
      * @param amount Amount of tokens to redeem
      * @return collateralOut Collateral received
-     * @dev Use this for multi-outcome markets or when FLAG_INVALID_REFUND is set
+     * @dev Use this when FLAG_INVALID_REFUND is set and market resolved as invalid
      */
     function redeemOutcome(
         bytes32 marketId,
@@ -423,7 +330,7 @@ contract SimpleRouter is ReentrancyGuard {
         uint256 amount
     ) external nonReentrant returns (uint256 collateralOut) {
         if (amount == 0) revert ZeroAmount();
-        
+
         // Transfer outcome tokens from user to router
         uint256 tokenId = _computeOutcomeTokenId(marketId, outcomeIndex);
         IOutcomeToken1155(outcomeToken1155).safeTransferFrom(
@@ -433,23 +340,23 @@ contract SimpleRouter is ReentrancyGuard {
             amount,
             ""
         );
-        
+
         // Ensure MarketCore has approval to burn router's outcome tokens
         _ensureOutcomeApproval();
-        
+
         // Execute redemption through MarketCore
         IMarketCore(marketCore).redeemWinnings(marketId, outcomeIndex, amount);
-        
+
         // Transfer collateral to user (1:1 redemption)
         address collateralToken = _getCollateralToken(marketId);
         collateralOut = amount;
         IERC20(collateralToken).safeTransfer(msg.sender, collateralOut);
-        
-        emit WinningsRedeemed(marketId, msg.sender, amount, collateralOut);
+
+        emit WinningsRedeemed(marketId, msg.sender, outcomeIndex, amount, collateralOut);
     }
 
     // ============ Liquidity Functions ============
-    
+
     /**
      * @notice Add liquidity to a market
      * @param marketId The market to provide liquidity to
@@ -465,25 +372,25 @@ contract SimpleRouter is ReentrancyGuard {
         uint256 minLpShares
     ) external nonReentrant returns (uint256 lpShares) {
         if (collateralAmount == 0) revert ZeroAmount();
-        
+
         // Get collateral token
         address collateralToken = _getCollateralToken(marketId);
-        
+
         // Transfer collateral from user to router
         IERC20(collateralToken).safeTransferFrom(msg.sender, address(this), collateralAmount);
-        
+
         // Ensure FpmmAMM has approval
         _ensureApproval(collateralToken, fpmmAMM, collateralAmount);
-        
+
         // Add liquidity through FpmmAMM
         lpShares = IFpmmAMM(fpmmAMM).addLiquidity(marketId, collateralAmount, minLpShares);
-        
+
         // Note: LP shares are tracked in FpmmAMM contract, credited to msg.sender
         // The router facilitated the transaction but shares belong to the caller
-        
+
         emit LiquidityProvided(marketId, msg.sender, collateralAmount, lpShares);
     }
-    
+
     /**
      * @notice Remove liquidity from a market
      * @param marketId The market to withdraw from
@@ -499,17 +406,17 @@ contract SimpleRouter is ReentrancyGuard {
         uint256 minCollateralOut
     ) external nonReentrant returns (uint256 collateralOut) {
         if (lpSharesIn == 0) revert ZeroAmount();
-        
+
         // Get number of outcomes for min amounts array
         (
             ,
             uint8 numOutcomes,
             ,
         ) = IFpmmAMM(fpmmAMM).getFpmmMarketConfig(marketId);
-        
+
         // Create zero min amounts (simplified - for precise control use FpmmAMM directly)
         uint256[] memory minOutcomeAmounts = new uint256[](numOutcomes);
-        
+
         // Remove liquidity through FpmmAMM
         (collateralOut, ) = IFpmmAMM(fpmmAMM).removeLiquidity(
             marketId,
@@ -517,103 +424,95 @@ contract SimpleRouter is ReentrancyGuard {
             minCollateralOut,
             minOutcomeAmounts
         );
-        
+
         // Transfer collateral to user
         address collateralToken = _getCollateralToken(marketId);
         IERC20(collateralToken).safeTransfer(msg.sender, collateralOut);
-        
+
         emit LiquidityWithdrawn(marketId, msg.sender, lpSharesIn, collateralOut);
     }
 
     // ============ View Functions ============
-    
+
     /**
-     * @notice Get current YES and NO prices for a binary market
+     * @notice Get prices for all outcomes in a market
      * @param marketId The market to query
-     * @return yesPrice YES price in 18 decimals (0.5e18 = 50%)
-     * @return noPrice NO price in 18 decimals (0.5e18 = 50%)
-     * @dev Prices always sum to approximately 1e18 (100%)
+     * @return prices Array of prices for each outcome (18 decimals, sum to ~1e18)
      */
-    function getPrices(bytes32 marketId) external view returns (
-        uint256 yesPrice,
-        uint256 noPrice
-    ) {
-        uint256[] memory prices = IFpmmAMM(fpmmAMM).getOutcomePrices(marketId);
-        
-        yesPrice = prices[YES];
-        noPrice = prices[NO];
+    function getOutcomePrices(bytes32 marketId) external view returns (uint256[] memory prices) {
+        return IFpmmAMM(fpmmAMM).getOutcomePrices(marketId);
     }
-    
+
     /**
-     * @notice Estimate YES tokens received for given collateral
+     * @notice Estimate tokens received for buying a specific outcome
      * @param marketId The market
+     * @param outcomeIndex Index of outcome to buy
      * @param collateralIn Amount of collateral to spend
-     * @return yesOut Estimated YES tokens to receive
+     * @return tokensOut Estimated outcome tokens to receive
      */
-    function estimateBuyYes(
+    function estimateBuy(
         bytes32 marketId,
+        uint8 outcomeIndex,
         uint256 collateralIn
-    ) external view returns (uint256 yesOut) {
-        return IFpmmAMM(fpmmAMM).calcBuyAmount(marketId, YES, collateralIn);
+    ) external view returns (uint256 tokensOut) {
+        return IFpmmAMM(fpmmAMM).calcBuyAmount(marketId, outcomeIndex, collateralIn);
     }
-    
+
     /**
-     * @notice Estimate NO tokens received for given collateral
+     * @notice Estimate collateral received for selling outcome tokens
      * @param marketId The market
-     * @param collateralIn Amount of collateral to spend
-     * @return noOut Estimated NO tokens to receive
-     */
-    function estimateBuyNo(
-        bytes32 marketId,
-        uint256 collateralIn
-    ) external view returns (uint256 noOut) {
-        return IFpmmAMM(fpmmAMM).calcBuyAmount(marketId, NO, collateralIn);
-    }
-    
-    /**
-     * @notice Estimate collateral received for selling YES tokens
-     * @param marketId The market
-     * @param yesIn Amount of YES tokens to sell
+     * @param outcomeIndex Index of outcome to sell
+     * @param tokensIn Amount of outcome tokens to sell
      * @return collateralOut Estimated collateral to receive
      */
-    function estimateSellYes(
+    function estimateSell(
         bytes32 marketId,
-        uint256 yesIn
+        uint8 outcomeIndex,
+        uint256 tokensIn
     ) external view returns (uint256 collateralOut) {
-        return IFpmmAMM(fpmmAMM).calcSellReturn(marketId, YES, yesIn);
+        return IFpmmAMM(fpmmAMM).calcSellReturn(marketId, outcomeIndex, tokensIn);
     }
-    
+
     /**
-     * @notice Estimate collateral received for selling NO tokens
+     * @notice Get user's token balance for a specific outcome
      * @param marketId The market
-     * @param noIn Amount of NO tokens to sell
-     * @return collateralOut Estimated collateral to receive
+     * @param outcomeIndex Index of outcome
+     * @param user The user address
+     * @return balance User's token balance for that outcome
      */
-    function estimateSellNo(
+    function getUserOutcomeBalance(
         bytes32 marketId,
-        uint256 noIn
-    ) external view returns (uint256 collateralOut) {
-        return IFpmmAMM(fpmmAMM).calcSellReturn(marketId, NO, noIn);
+        uint8 outcomeIndex,
+        address user
+    ) external view returns (uint256 balance) {
+        uint256 tokenId = _computeOutcomeTokenId(marketId, outcomeIndex);
+        return IOutcomeToken1155(outcomeToken1155).balanceOf(user, tokenId);
     }
-    
+
     /**
-     * @notice Get user's YES and NO token balances for a binary market
+     * @notice Get user's token balances for all outcomes in a market
      * @param marketId The market
      * @param user The user address
-     * @return yesBalance User's YES token balance
-     * @return noBalance User's NO token balance
+     * @return balances Array of balances for each outcome
      */
-    function getUserBalances(
+    function getUserAllOutcomeBalances(
         bytes32 marketId,
         address user
-    ) external view returns (uint256 yesBalance, uint256 noBalance) {
-        uint256 yesTokenId = _computeOutcomeTokenId(marketId, YES);
-        uint256 noTokenId = _computeOutcomeTokenId(marketId, NO);
-        
-        yesBalance = IOutcomeToken1155(outcomeToken1155).balanceOf(user, yesTokenId);
-        noBalance = IOutcomeToken1155(outcomeToken1155).balanceOf(user, noTokenId);
+    ) external view returns (uint256[] memory balances) {
+        (
+            ,
+            uint8 numOutcomes,
+            ,
+        ) = IFpmmAMM(fpmmAMM).getFpmmMarketConfig(marketId);
+
+        balances = new uint256[](numOutcomes);
+        for (uint8 i = 0; i < numOutcomes;) {
+            uint256 tokenId = _computeOutcomeTokenId(marketId, i);
+            balances[i] = IOutcomeToken1155(outcomeToken1155).balanceOf(user, tokenId);
+            unchecked { ++i; }
+        }
     }
-    
+
     /**
      * @notice Get user's LP share balance for a market
      * @param marketId The market
@@ -626,7 +525,7 @@ contract SimpleRouter is ReentrancyGuard {
     ) external view returns (uint256 lpBalance) {
         return IFpmmAMM(fpmmAMM).lpShares(marketId, user);
     }
-    
+
     /**
      * @notice Get market status and resolution info
      * @param marketId The market
@@ -641,7 +540,26 @@ contract SimpleRouter is ReentrancyGuard {
     ) {
         return IMarketCore(marketCore).getMarketState(marketId);
     }
-    
+
+    /**
+     * @notice Get market configuration
+     * @param marketId The market
+     * @return collateralToken The ERC-20 collateral token address
+     * @return numOutcomes Number of outcomes in this market
+     * @return liquidityParameterB LMSR liquidity parameter
+     */
+    function getMarketConfig(bytes32 marketId) external view returns (
+        address collateralToken,
+        uint8 numOutcomes,
+        uint256 liquidityParameterB
+    ) {
+        (
+            collateralToken,
+            numOutcomes,
+            liquidityParameterB,
+        ) = IFpmmAMM(fpmmAMM).getFpmmMarketConfig(marketId);
+    }
+
     /**
      * @notice Get collateral token for a market
      * @param marketId The market
@@ -652,7 +570,7 @@ contract SimpleRouter is ReentrancyGuard {
     }
 
     // ============ Internal Functions ============
-    
+
     /**
      * @dev Get collateral token address from FpmmAMM market config
      */
@@ -664,7 +582,7 @@ contract SimpleRouter is ReentrancyGuard {
         ) = IFpmmAMM(fpmmAMM).getFpmmMarketConfig(marketId);
         return collateralToken;
     }
-    
+
     /**
      * @dev Compute ERC-1155 token ID from market ID and outcome index
      */
@@ -674,7 +592,7 @@ contract SimpleRouter is ReentrancyGuard {
     ) internal pure returns (uint256) {
         return (uint256(marketId) << 8) | uint256(outcomeIndex);
     }
-    
+
     /**
      * @dev Ensure router has given spender approval for ERC-20 token
      *      Uses lazy approval pattern - approves max once, never again
@@ -686,7 +604,7 @@ contract SimpleRouter is ReentrancyGuard {
             IERC20(token).forceApprove(spender, type(uint256).max);
         }
     }
-    
+
     /**
      * @dev Ensure MarketCore and FpmmAMM have approval for router's outcome tokens
      *      Approves both contracts once for all-token operations
@@ -696,7 +614,7 @@ contract SimpleRouter is ReentrancyGuard {
         if (!IOutcomeToken1155(outcomeToken1155).isApprovedForAll(address(this), marketCore)) {
             IOutcomeToken1155(outcomeToken1155).setApprovalForAll(marketCore, true);
         }
-        
+
         // Approve FpmmAMM if not already
         if (!IOutcomeToken1155(outcomeToken1155).isApprovedForAll(address(this), fpmmAMM)) {
             IOutcomeToken1155(outcomeToken1155).setApprovalForAll(fpmmAMM, true);
@@ -704,7 +622,7 @@ contract SimpleRouter is ReentrancyGuard {
     }
 
     // ============ ERC-1155 Receiver Implementation ============
-    
+
     /**
      * @notice Handle receipt of single ERC-1155 token
      * @dev Required for router to receive outcome tokens during operations
@@ -718,7 +636,7 @@ contract SimpleRouter is ReentrancyGuard {
     ) external pure returns (bytes4) {
         return this.onERC1155Received.selector;
     }
-    
+
     /**
      * @notice Handle receipt of batch ERC-1155 tokens
      * @dev Required for router to receive multiple outcome tokens
@@ -742,7 +660,7 @@ contract SimpleRouter is ReentrancyGuard {
  */
 interface IMarketCore {
     enum MarketStatus { Open, Resolvable, Resolved }
-    
+
     struct MarketParams {
         address collateralToken;
         uint64 marketDeadline;
@@ -751,13 +669,13 @@ interface IMarketCore {
         address oracle;
         bytes32 questionId;
     }
-    
+
     function getMarketState(bytes32 marketId) external view returns (
         MarketStatus status,
         uint8 winningOutcomeIndex,
         bool isInvalid
     );
-    
+
     function getMarketParams(bytes32 marketId) external view returns (MarketParams memory);
     function redeemWinnings(bytes32 marketId, uint8 outcomeIndex, uint256 amount) external;
 }
@@ -773,34 +691,34 @@ interface IFpmmAMM {
         uint256 collateralIn,
         uint256 minOutcomeOut
     ) external returns (uint256);
-    
+
     function sellOutcome(
         bytes32 marketId,
         uint8 outcomeIndex,
         uint256 outcomeIn,
         uint256 minCollateralOut
     ) external returns (uint256);
-    
+
     function addLiquidity(
         bytes32 marketId,
         uint256 collateralAmount,
         uint256 minLpSharesOut
     ) external returns (uint256);
-    
+
     function removeLiquidity(
         bytes32 marketId,
         uint256 lpSharesIn,
         uint256 minCollateralOut,
         uint256[] calldata minOutcomeAmounts
     ) external returns (uint256, uint256[] memory);
-    
+
     function getFpmmMarketConfig(bytes32 marketId) external view returns (
         address collateralToken,
         uint8 numOutcomes,
         uint256 liquidityParameterB,
         uint256[] memory outcomeTokenIds
     );
-    
+
     function getOutcomePrices(bytes32 marketId) external view returns (uint256[] memory);
     function calcBuyAmount(bytes32 marketId, uint8 outcomeIndex, uint256 collateralIn) external view returns (uint256);
     function calcSellReturn(bytes32 marketId, uint8 outcomeIndex, uint256 outcomeIn) external view returns (uint256);
