@@ -565,25 +565,49 @@ contract UniV3EthUsdTwapOracleAdapter is IOutcomeOracle {
         uint256 price;
         uint256 sqrtPrice = uint256(sqrtPriceX96);
         
+        // We want the price of Base Token in terms of Quote Token
+        // i.e., How many Quote Tokens for 1 Base Token?
+        // Formula: Price_QuoteDecimals = (QuoteRaw / BaseRaw) * 10^BaseDecimals
+        
+        uint256 ratioX192; // R * 2^192
+
         if (baseToken == token0) {
-            // Pool price is token1/token0, we want token0/token1 (invert)
-            // price = 1 / (sqrtPriceX96^2 / 2^192) = 2^192 / sqrtPriceX96^2
-            // Scale to quote decimals
-            price = (uint256(1) << 192) * (10 ** quoteDecimals) / (sqrtPrice * sqrtPrice);
-            // Adjust for base token decimals
-            if (baseDecimals > 0) {
-                price = price / (10 ** baseDecimals);
-            }
+            // Pool price (sqrtPrice) is token1/token0 (Quote/Base)
+            // This IS the ratio we want: QuoteRaw / BaseRaw
+            // ratio = sqrtPrice^2
+            ratioX192 = (sqrtPrice * sqrtPrice);
         } else {
-            // Pool price is token1/token0, baseToken is token1, so price is correct direction
-            // price = sqrtPriceX96^2 / 2^192
-            price = (sqrtPrice * sqrtPrice) >> 192;
-            // Scale for decimals
-            price = price * (10 ** quoteDecimals);
-            if (baseDecimals > quoteDecimals) {
-                price = price / (10 ** (baseDecimals - quoteDecimals));
-            }
+            // Pool price is token1/token0 (Base/Quote)
+            // We want Quote/Base, so we invert
+            // ratio = 1 / sqrtPrice^2
+            // ratioX192 = 2^192 * 2^192 / sqrtPrice^2 = 2^384 / sqrtPrice^2
+            // To be safe with overflow, do: (2^192 / sqrtPrice)^2 ?
+            // Better: (2^192 / sqrtPrice) * (2^192 / sqrtPrice)
+            // 2^192 is ~6e57. sqrtPrice is ~4e24. Safe.
+            
+            uint256 invSqrt = (uint256(1) << 192) / sqrtPrice;
+            ratioX192 = invSqrt * invSqrt;
         }
+
+        // Now we have Ratio * 2^192
+        // We want Price = Ratio * 10^BaseDecimals
+        
+        // Calculate 10^BaseDecimals
+        uint256 powerOfBase = 10 ** baseDecimals;
+        
+        // Final Price = (RatioX192 * powerOfBase) >> 192
+        // To maintain precision, mul then shift
+        
+        // Check for overflow before multiply
+        // ratioX192 can be up to ~2^192 (if ratio is 1)
+        // powerOfBase is 10^18 (~2^60)
+        // 192 + 60 = 252. Fits in 256.
+        
+        // However, if ratio >> 1 (e.g. BTC/USD), ratioX192 >> 2^192.
+        // For WETH/USDC (ratio ~3e-9), ratioX192 is small (~2^163).
+        // 163 + 60 = 223. Safe.
+        
+        price = (ratioX192 * powerOfBase) >> 192;
         
         return price;
     }

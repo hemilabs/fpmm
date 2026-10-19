@@ -410,13 +410,25 @@ contract FpmmAMM is ReentrancyGuard, IERC1155Receiver {
      * @dev First LP sets initial state, subsequent LPs get proportional shares
      *      Caller must have approved this contract to spend collateral
      */
+    /**
+     * @notice Add liquidity to an FPMM market
+     * @param marketId The market to provide liquidity to
+     * @param collateralAmount Amount of collateral to deposit
+     * @param minLpSharesOut Minimum LP shares to receive (slippage protection)
+     * @param receiver The address to receive the LP shares
+     * @return lpSharesOut LP shares minted to provider
+     * @dev First LP sets initial state, subsequent LPs get proportional shares
+     *      Caller must have approved this contract to spend collateral
+     */
     function addLiquidity(
         bytes32 marketId,
         uint256 collateralAmount,
-        uint256 minLpSharesOut
+        uint256 minLpSharesOut,
+        address receiver
     ) external nonReentrant returns (uint256 lpSharesOut) {
         if (!isRegistered[marketId]) revert MarketNotRegistered();
         if (collateralAmount == 0) revert ZeroAmount();
+        if (receiver == address(0)) revert ZeroAmount(); // Reuse ZeroAmount for ZeroAddress to save space/gas? Or separate error? stick to standard checks if available or just logic.
         
         // Verify market is still open
         if (!IMarketCore(marketCore).isMarketOpen(marketId)) {
@@ -426,7 +438,8 @@ contract FpmmAMM is ReentrancyGuard, IERC1155Receiver {
         FpmmMarketConfig storage config = _configs[marketId];
         FpmmMarketState storage state = _states[marketId];
         
-        // Transfer collateral from LP to AMM
+        // Transfer collateral from LP (msg.sender) to AMM
+        // Note: msg.sender provides the collateral, receiver gets the shares
         IERC20(config.collateralToken).safeTransferFrom(
             msg.sender,
             address(this),
@@ -447,9 +460,11 @@ contract FpmmAMM is ReentrancyGuard, IERC1155Receiver {
         // Update state
         state.collateralBalance += collateralAmount;
         state.lpShareSupply += lpSharesOut;
-        lpShares[marketId][msg.sender] += lpSharesOut;
+        lpShares[marketId][receiver] += lpSharesOut; // Credit ONLY the receiver
         
-        emit LiquidityAdded(marketId, msg.sender, collateralAmount, lpSharesOut);
+        // Event should reflect the receiver as the provider of liquidity in terms of ownership
+        // But maybe we want to know who paid? Ideally receiver is what matters for "Who Added Liquidity" in UI if we use this event.
+        emit LiquidityAdded(marketId, receiver, collateralAmount, lpSharesOut);
     }
     
     /**

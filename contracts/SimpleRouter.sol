@@ -383,10 +383,8 @@ contract SimpleRouter is ReentrancyGuard {
         _ensureApproval(collateralToken, fpmmAMM, collateralAmount);
 
         // Add liquidity through FpmmAMM
-        lpShares = IFpmmAMM(fpmmAMM).addLiquidity(marketId, collateralAmount, minLpShares);
-
-        // Note: LP shares are tracked in FpmmAMM contract, credited to msg.sender
-        // The router facilitated the transaction but shares belong to the caller
+        // Pass msg.sender as the receiver so shares are credited to the USER, not the Router
+        lpShares = IFpmmAMM(fpmmAMM).addLiquidity(marketId, collateralAmount, minLpShares, msg.sender);
 
         emit LiquidityProvided(marketId, msg.sender, collateralAmount, lpShares);
     }
@@ -702,7 +700,8 @@ interface IFpmmAMM {
     function addLiquidity(
         bytes32 marketId,
         uint256 collateralAmount,
-        uint256 minLpSharesOut
+        uint256 minLpSharesOut,
+        address receiver
     ) external returns (uint256);
 
     function removeLiquidity(
